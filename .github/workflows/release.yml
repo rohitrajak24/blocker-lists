@@ -1,0 +1,69 @@
+name: release
+
+# The private build pushes a signed list to the "incoming" branch.
+# This workflow checks it independently (OpenSSL, not the build's own code) and publishes a release.
+
+on:
+  push:
+    branches: [incoming]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch the incoming list
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: incoming
+          path: incoming
+          persist-credentials: false
+
+      - name: Fetch the public key from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: main
+          persist-credentials: false
+
+      - name: Verify signature, hash, size and sequence
+        working-directory: incoming
+        run: |
+          set -euo pipefail
+          openssl dgst -sha256 -verify ../main/lists-public-key.pem -signature blocklist.bin.sig blocklist.bin
+          test "$(sha256sum blocklist.bin | cut -d' ' -f1)" = "$(jq -r .sha256 latest.json)"
+          test "$(stat -c%s blocklist.bin)" = "$(jq -r .size latest.json)"
+          test "$(stat -c%s blocklist.bin.gz)" = "$(jq -r .gzSize latest.json)"
+          gunzip -c blocklist.bin.gz | cmp - blocklist.bin
+          header_seq=$(od -An -t u4 -j 16 -N 4 --endian=little blocklist.bin | tr -d ' ')
+          test "$header_seq" = "$(jq -r .sequence latest.json)"
+          echo "SEQUENCE=$header_seq" >> "$GITHUB_ENV"
+
+      - name: Refuse to go backwards
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null | sed 's/^list-//' || true)
+          if [ -n "$current" ] && [ "$SEQUENCE" -le "$current" ]; then
+            echo "Sequence $SEQUENCE is not newer than published $current"; exit 1
+          fi
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: incoming
+        run: |
+          gh release create "list-${SEQUENCE}" \
+            blocklist.bin blocklist.bin.gz blocklist.bin.sig latest.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Block list ${SEQUENCE}" \
+            --notes-file report.md \
+            --latest
